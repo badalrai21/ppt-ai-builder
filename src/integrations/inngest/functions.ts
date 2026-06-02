@@ -12,13 +12,16 @@ import { inngest } from './client'
 
 function buildImageKitUrl(prompt: string, filename: string): string {
   const baseUrl = process.env.IMAGEKIT_BASE_URL!
+
   const sanitizedPrompt = prompt
     .replace(/[^\w\s-]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 100)
 
-  return `${baseUrl}/ik-genimg-prompt-${encodeURIComponent(sanitizedPrompt)}/${filename}.jpg?tr=w-1280,h-720`
+  return `${baseUrl}/ik-genimg-prompt-${encodeURIComponent(
+    sanitizedPrompt,
+  )}/${filename}.jpg?tr=w-1280,h-720`
 }
 
 // ---------------------------------------------------------------------------
@@ -47,25 +50,50 @@ export const generatePresentation = inngest.createFunction(
     triggers: [{ event: 'presentation/generate' }],
   },
   async ({ event, step }) => {
-    const { presentationId } = event.data as { presentationId: string }
+    console.log('==============================')
+    console.log('FUNCTION STARTED')
+    console.log('EVENT DATA:', event.data)
+    console.log('==============================')
 
-    const presentation = await step.run('fetch-presentation', async () => {
-      const p = await prisma.presentation.findUnique({
-        where: { id: presentationId },
+    try {
+      const { presentationId } = event.data as {
+        presentationId: string
+      }
+
+      console.log('Fetching presentation:', presentationId)
+
+      const presentation = await step.run(
+        'fetch-presentation',
+        async () => {
+          const p = await prisma.presentation.findUnique({
+            where: { id: presentationId },
+          })
+
+          if (!p) {
+            throw new Error('Presentation not found')
+          }
+
+          return p
+        },
+      )
+
+      console.log('Presentation found:', presentation.title)
+
+      await step.run('mark-generating', async () => {
+        await prisma.presentation.update({
+          where: { id: presentationId },
+          data: { status: 'GENERATING' },
+        })
       })
-      if (!p) throw new Error('Presentation not found')
-      return p
-    })
 
-    await step.run('mark-generating', async () => {
-      await prisma.presentation.update({
-        where: { id: presentationId },
-        data: { status: 'GENERATING' },
-      })
-    })
+      console.log('Status set to GENERATING')
 
-    const { slides } = await step.run('generate-slides-content', async () => {
-      const systemPrompt = `You are an expert presentation designer. Given a user's content/prompt, create a compelling presentation.
+      const { slides } = await step.run(
+        'generate-slides-content',
+        async () => {
+          console.log('BEFORE GEMINI CALL')
+
+          const systemPrompt = `You are an expert presentation designer. Given a user's content/prompt, create a compelling presentation.
 
 Style: ${presentation.style}
 Tone: ${presentation.tone}
@@ -80,50 +108,79 @@ Guidelines:
 - For imagePrompt, describe a professional illustration that complements the slide (no text in images)
 `
 
-      const result = await generateText({
-        model: google('gemini-2.5-flash'),
-        output: Output.object({ schema: slidesResponseSchema }),
-        system: systemPrompt,
-        prompt: presentation.prompt,
+          const result = await generateText({
+            model: google('gemini-2.5-flash'),
+            output: Output.object({
+              schema: slidesResponseSchema,
+            }),
+            system: systemPrompt,
+            prompt: presentation.prompt,
+          })
+
+          console.log('AFTER GEMINI CALL')
+          console.log(
+            'Generated slides:',
+            result.output.slides.length,
+          )
+
+          return result.output
+        },
+      )
+
+      await step.run('delete-old-slides', async () => {
+        await prisma.slide.deleteMany({
+          where: { presentationId },
+        })
       })
 
-      return result.output
-    })
+      console.log('Old slides deleted')
 
-    await step.run('delete-old-slides', async () => {
-      await prisma.slide.deleteMany({
-        where: { presentationId },
+      await step.run('create-slides', async () => {
+        const data = slides.map((s, i) => {
+          const imageUrl = buildImageKitUrl(
+            s.imagePrompt,
+            `slide-${presentationId}-${i}`,
+          )
+
+          return {
+            presentationId,
+            order: i,
+            title: s.title,
+            content: s.content,
+            notes: s.notes ?? null,
+            imagePrompt: s.imagePrompt,
+            imageUrl,
+          }
+        })
+
+        await prisma.slide.createMany({
+          data,
+        })
+
+        console.log('Slides inserted into database')
       })
-    })
 
-    await step.run('create-slides', async () => {
-      const data = slides.map((s, i) => {
-        const imageUrl = buildImageKitUrl(
-          s.imagePrompt,
-          `slide-${presentationId}-${i}`,
-        )
-        return {
-          presentationId,
-          order: i,
-          title: s.title,
-          content: s.content,
-          notes: s.notes ?? null,
-          imagePrompt: s.imagePrompt,
-          imageUrl,
-        }
+      await step.run('mark-completed', async () => {
+        await prisma.presentation.update({
+          where: { id: presentationId },
+          data: { status: 'COMPLETED' },
+        })
       })
 
-      await prisma.slide.createMany({ data })
-    })
+      console.log('Presentation marked COMPLETED')
 
-    await step.run('mark-completed', async () => {
-      await prisma.presentation.update({
-        where: { id: presentationId },
-        data: { status: 'COMPLETED' },
-      })
-    })
+      return {
+        success: true,
+        slideCount: slides.length,
+      }
+    } catch (error) {
+      console.error('================================')
+      console.error('PRESENTATION GENERATION FAILED')
+      console.error(error)
+      console.error('================================')
 
-    return { success: true, slideCount: slides.length }
+      throw error
+    }
   },
 )
 
@@ -134,6 +191,9 @@ export const helloWorld = inngest.createFunction(
   },
   async ({ event, step }) => {
     await step.sleep('wait-a-moment', '1s')
-    return { message: `Hello ${event.data.email}!` }
+
+    return {
+      message: `Hello ${event.data.email}!`,
+    }
   },
 )

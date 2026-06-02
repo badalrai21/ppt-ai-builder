@@ -9,7 +9,7 @@ RUN apk add --no-cache openssl
 COPY package.json package-lock.json* pnpm-lock.yaml* ./
 
 # Install dependencies
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --legacy-peer-deps
 
 # Copy source
 COPY . .
